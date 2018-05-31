@@ -24,8 +24,11 @@ var (
 	walletDstAmount, _  = dcrutil.NewAmount(0.1)    // what each wallet gets back
 
 	// protocol is which set of functions (which particular schnorr protocol) to
-	// use when signing messages/transactions
-	protocol schnorrProtocol = originalDcrSchnorrProtocol{}
+	// use when signing messages/transactions. Options:
+	//
+	//   naiveSchnorrProtocol{}
+	//   musigSchnorrProtocol{}
+	protocol schnorrProtocol = musigSchnorrProtocol{}
 
 	currentScriptFlags = txscript.ScriptBip16 |
 		txscript.ScriptDiscourageUpgradableNops |

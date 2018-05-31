@@ -27,13 +27,13 @@ type schnorrProtocol interface {
 // originalDcrSchnorrProtocol fulfills the schnorrProtocol interface. It does so
 // by using the original functions (combinePubKeys, partialSign) exported by
 // the schnorr package of decred.
-type originalDcrSchnorrProtocol struct{}
+type naiveSchnorrProtocol struct{}
 
-func (p originalDcrSchnorrProtocol) combinePubKeys(pubs []*secp256k1.PublicKey) (*secp256k1.PublicKey, error) {
+func (p naiveSchnorrProtocol) combinePubKeys(pubs []*secp256k1.PublicKey) (*secp256k1.PublicKey, error) {
 	return schnorr.CombinePubkeys(pubs), nil
 }
 
-func (p originalDcrSchnorrProtocol) partialSign(msg []byte,
+func (p naiveSchnorrProtocol) partialSign(msg []byte,
 	privKey *secp256k1.PrivateKey, privNonce *secp256k1.PrivateKey,
 	pubKey *secp256k1.PublicKey, pubNonce *secp256k1.PublicKey,
 	allPubKeys []*secp256k1.PublicKey, allPubNonces []*secp256k1.PublicKey) (*schnorr.Signature, error) {
@@ -41,6 +41,9 @@ func (p originalDcrSchnorrProtocol) partialSign(msg []byte,
 	// the original decred functions, as exemplified in the threshold_test.go
 	// file, call for a partial signature that combines all public nonces, except
 	// the one from the local node.
+	// That happens because the schnorrSign function, that does the actual signature
+	// computation, already calculates the local public key from the private key
+	// and adds whatever is passed as public nonce.
 	// Therefore, we need to create a new slice, taking care to exclude the local
 	// nonce pointed in pubNonce.
 
@@ -58,7 +61,24 @@ func (p originalDcrSchnorrProtocol) partialSign(msg []byte,
 
 // naiveSchnorrProtocol fulfills the schnorrProtocol interface. It does so by
 // using the naive schnorr protocol
-type naiveSchnorrProtocol struct{}
+type musigSchnorrProtocol struct{}
+
+func (p musigSchnorrProtocol) combinePubKeys(pubs []*secp256k1.PublicKey) (*secp256k1.PublicKey, error) {
+	return combinePubkeysMusig(pubs), nil
+}
+
+func (p musigSchnorrProtocol) partialSign(msg []byte,
+	privKey *secp256k1.PrivateKey, privNonce *secp256k1.PrivateKey,
+	pubKey *secp256k1.PublicKey, pubNonce *secp256k1.PublicKey,
+	allPubKeys []*secp256k1.PublicKey, allPubNonces []*secp256k1.PublicKey) (*schnorr.Signature, error) {
+
+	// note that, contrary to the original decred functions, the musig ones
+	// do **NOT** add the local public key, so we pass the whole public nonce
+	// combined.
+	combinedPubs := schnorr.CombinePubkeys(allPubNonces)
+
+	return partialSignMusig(curve, msg, privKey, privNonce, combinedPubs, allPubKeys)
+}
 
 // signWithPair is a helper function that simulates the current schnorr protocol
 // (the global `protocol` var) with 2 private keys.
@@ -104,7 +124,8 @@ func signWithPair(priv1, priv2 *secp256k1.PrivateKey, msg []byte) *schnorr.Signa
 
 	// Wallets can now verify that the signature is correct
 
-	combinedPub := schnorr.CombinePubkeys([]*secp256k1.PublicKey{pub1, pub2})
+	combinedPub, err := protocol.combinePubKeys(allPubs)
+	orPanic(err)
 	res := schnorr.Verify(combinedPub, msg, fullSig.R, fullSig.S)
 	if !res {
 		orPanic(errors.New("VERIFY FAILED!"))
