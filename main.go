@@ -2,8 +2,6 @@ package main
 
 import (
 	"encoding/hex"
-	"errors"
-	"fmt"
 
 	"github.com/decred/dcrd/dcrutil"
 	"github.com/decred/dcrd/txscript"
@@ -25,6 +23,10 @@ var (
 	wallet2SrcAmount, _ = dcrutil.NewAmount(0.2008) // two times the above
 	walletDstAmount, _  = dcrutil.NewAmount(0.1)    // what each wallet gets back
 
+	// protocol is which set of functions (which particular schnorr protocol) to
+	// use when signing messages/transactions
+	protocol schnorrProtocol = originalDcrSchnorrProtocol{}
+
 	currentScriptFlags = txscript.ScriptBip16 |
 		txscript.ScriptDiscourageUpgradableNops |
 		txscript.ScriptVerifyDERSignatures |
@@ -36,18 +38,21 @@ var (
 		txscript.ScriptVerifySHA256
 )
 
-func orPanic(err error) {
-	if err != nil {
-		panic(err)
-	}
-}
+// walletConns connects to two standard wallets.
+func walletConns() (*wallet, *wallet) {
+	w1 := connectToWallet("localhost:19121", "/home/user/.config/decrediton/wallets/testnet/default-wallet/rpc.cert")
+	w1.passphrase = []byte("123")
+	log("Connected to wallet 1")
 
-func log(format string, args ...interface{}) {
-	fmt.Printf(format, args...)
-	fmt.Printf("\n")
+	w2 := connectToWallet("localhost:19221", "/home/user/.config/decrediton/wallets/testnet/new-testnet02/rpc.cert")
+	w2.passphrase = []byte("123")
+	log("Connected to wallet 2")
+
+	return w1, w2
 }
 
 func main() {
+	// choose which test(s) you want to run by commenting/uncommenting the lines.
 	// mainRandomKeys()
 	// mainWalletKeys()
 	// mainTx()
@@ -64,18 +69,6 @@ func mainRandomKeys() {
 
 	signWithPair(priv1, priv2, sampleMsg)
 	log("Testing with random keys worked")
-}
-
-func walletConns() (*wallet, *wallet) {
-	w1 := connectToWallet("localhost:19121", "/home/user/.config/decrediton/wallets/testnet/default-wallet/rpc.cert")
-	w1.passphrase = []byte("123")
-	log("Connected to wallet 1")
-
-	w2 := connectToWallet("localhost:19221", "/home/user/.config/decrediton/wallets/testnet/new-testnet02/rpc.cert")
-	w2.passphrase = []byte("123")
-	log("Connected to wallet 2")
-
-	return w1, w2
 }
 
 // test signing with wallet generated keys
@@ -95,51 +88,6 @@ func mainWalletKeys() {
 	log("Testing with wallet keys worked")
 }
 
-func signWithPair(priv1, priv2 *secp256k1.PrivateKey, msg []byte) *schnorr.Signature {
-	extra := []byte(nil)
-	version := schnorr.BlakeVersionStringRFC6979
-
-	// Generate the nonce'd priv/pub keypair for each wallet
-	spriv1, spub1, err := schnorr.GenerateNoncePair(curve, msg, priv1, extra, version)
-	orPanic(err)
-
-	spriv2, spub2, err := schnorr.GenerateNoncePair(curve, msg, priv2, extra, version)
-	orPanic(err)
-
-	// the wallets exchange their respective spub* to each other.
-
-	// Generate a partial sig of the data on each wallet
-	// (the combinedPub* are the pubkeys of the wallets other than the one
-	// signing)
-	combinedPub1 := schnorr.CombinePubkeys([]*secp256k1.PublicKey{spub2})
-	sig1, err := schnorr.PartialSign(curve, msg, priv1, spriv1, combinedPub1)
-	orPanic(err)
-
-	combinedPub2 := schnorr.CombinePubkeys([]*secp256k1.PublicKey{spub1})
-	sig2, err := schnorr.PartialSign(curve, msg, priv2, spriv2, combinedPub2)
-	orPanic(err)
-
-	// the wallets exchange their respective sig* to each other
-	// any/all wallets may do this to create the full sig:
-
-	fullSig, err := schnorr.CombineSigs(curve, []*schnorr.Signature{sig1, sig2})
-	orPanic(err)
-
-	pub1 := secp256k1.PublicKey(priv1.PublicKey)
-	pub2 := secp256k1.PublicKey(priv2.PublicKey)
-
-	// Wallets now share their respective pub* keys. They can now verify the
-	// signature is correct each by doing the following:
-
-	combinedPub := schnorr.CombinePubkeys([]*secp256k1.PublicKey{&pub1, &pub2})
-	res := schnorr.Verify(combinedPub, msg, fullSig.R, fullSig.S)
-	if !res {
-		orPanic(errors.New("VERIFY FAILED!"))
-	}
-
-	return fullSig
-}
-
 func mainTx() {
 	w1, w2 := walletConns()
 
@@ -155,42 +103,51 @@ func mainTx() {
 	pub2 := secp256k1.PublicKey(priv2.PublicKey)
 	dst2, _ := w2.nextAddress()
 
+	allPubs := []*secp256k1.PublicKey{&pub1, &pub2}
+
 	// wallets share their respective pubkeys
 
-	combinedPub := schnorr.CombinePubkeys([]*secp256k1.PublicKey{&pub1, &pub2})
+	combinedPub, err := protocol.combinePubKeys(allPubs)
+	orPanic(err)
 	addr, err := dcrutil.NewAddressSecSchnorrPubKey(combinedPub.Serialize(), net)
 	orPanic(err)
 
 	log("Generated schnorr addr: %s", addr.EncodeAddress())
 
-	// each wallet generates the inputs and change output
-	// they share those
+	// Each wallet generates the inputs and change output.
+	// They share those.
 
 	w1change, w1inputs, utxos1 := w1.genSrcTxData(addr)
 	w2change, w2inputs, utxos2 := w2.genSrcTxData(addr)
 
-	// the unsigned source tx can be created
+	// The unsigned source tx, which aggregates inputs from both wallets into
+	// a single destination output can be created.
 	srcTx := makeSrcTx(w1change, w1inputs, w2change, w2inputs, addr)
 
-	// each wallet signs their respective inputs (we create a copy to simulate
-	// each wallet having a non-signed template )
+	// Each wallet signs their respective inputs (we create a copy to simulate
+	// each wallet having a non-signed template, with srcTx getting all
+	// signatures). In practice, the signatures would have to be shared among
+	// the wallets so that each could build the final signed srcTx.
 	template := srcTx.Copy()
 	w1.signSrcTx(template, srcTx, utxos2)
 	w2.signSrcTx(template, srcTx, utxos1)
 
-	// and the unsigned destination tx can be created as well
+	// The unsigned destination tx can now be created. This is the tx that
+	// spends from the combined output of the srcTx.
 	dstTx := makeDstTx(dst1, dst2, srcTx)
 
-	// get the data to sign the transaction
+	// Get the data to sign the redeem transaction. Remember that
+	// srcTx.TxOut[0] is the output that can be redeemed with a schnorr
+	// signature.
 	hashToSign, err := txscript.CalcSignatureHash(srcTx.TxOut[0].PkScript,
 		txscript.SigHashAll, dstTx, 0, nil)
 	orPanic(err)
 
-	// each wallet can now create its partial sig
-	// the partial sigs are exchanged, and the final sig is assembled.
+	// Each wallet can now create its partial sig.
+	// The partial sigs are exchanged, and the final sig is assembled.
 	fullSig := signWithPair(priv1, priv2, hashToSign)
 
-	// and now we assemble the SigScript as a data push, so that the vm
+	// Now we assemble the SigScript as a data push, so that the vm
 	// will process it correctly. Note the append of sig type at the end.
 	fullSigBytes := fullSig.Serialize()
 	sigScript, err := txscript.NewScriptBuilder().
@@ -199,8 +156,13 @@ func mainTx() {
 	orPanic(err)
 	dstTx.TxIn[0].SignatureScript = sigScript
 
-	// and now the network will do something like this to verify if the tx
-	// is correctly signed
+	// At this point, dstTx is signed and finalized and can be published to
+	// the network, where it will be mined (assuming srcTx has been previously
+	// published and mined as well).
+
+	// The network will do something like this to verify if the input of the
+	// dstTx is correctly signed (remember that dstTx.TxIn[0] is redeeming
+	// srcTx.TxOut[0]).
 	vm, err := txscript.NewEngine(srcTx.TxOut[0].PkScript, dstTx, 0,
 		currentScriptFlags, srcTx.TxOut[0].Version, nil)
 	orPanic(err)
@@ -208,7 +170,10 @@ func mainTx() {
 	err = vm.Execute()
 	orPanic(err)
 
-	// all done! Publish them to see magic!
+	// If execution didn't panic so far, it means the verification of the schnorr
+	// signature passed. Woohoo!
+	// Let's output the final txs, so we can actually test broadcasting them via
+	// dcrd or dcrdata.
 	srcTxBytes, err := srcTx.Bytes()
 	orPanic(err)
 	log("Source tx")
@@ -220,6 +185,11 @@ func mainTx() {
 	log(hex.EncodeToString(dstTxBytes))
 }
 
+// This will simulate making a schnorr sig tx but using only a single wallet
+// and a *big* number of partial sigs. The process is similar to the one for
+// two wallets (so look at the comments there), except we're being silly
+// and simulating as if there was a very large number of wallets involved in the
+// partial sig.
 func mainTxSingle() {
 	w1 := connectToWallet("localhost:19121", "/home/user/.config/decrediton/wallets/testnet/default-wallet/rpc.cert")
 	w1.passphrase = []byte("123")
@@ -246,7 +216,8 @@ func mainTxSingle() {
 		pubs[i] = &pub
 	}
 
-	combinedPub := schnorr.CombinePubkeys(pubs)
+	combinedPub, err := protocol.combinePubKeys(pubs)
+	orPanic(err)
 	addr, err := dcrutil.NewAddressSecSchnorrPubKey(combinedPub.Serialize(), net)
 	orPanic(err)
 	log("Generated schnorr addr: %s", addr.EncodeAddress())
@@ -270,22 +241,10 @@ func mainTxSingle() {
 		spubs[i] = spub
 	}
 
-	noncesToCombine := make([]*secp256k1.PublicKey, numKeys-1)
 	for i := 0; i < numKeys; i++ {
-		nidx := 0
-		for j := 0; j < numKeys; j++ {
-			if i == j {
-				continue
-			}
-			noncesToCombine[nidx] = spubs[j]
-			nidx++
-		}
-
-		combinedPartial := schnorr.CombinePubkeys(noncesToCombine)
-		sig, err := schnorr.PartialSign(curve, hashToSign[:], privs[i],
-			sprivs[i], combinedPartial)
+		sig, err := protocol.partialSign(hashToSign[:], privs[i], sprivs[i],
+			pubs[i], spubs[i], pubs, spubs)
 		orPanic(err)
-
 		partialSigs[i] = sig
 	}
 

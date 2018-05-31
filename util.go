@@ -10,6 +10,17 @@ import (
 	"github.com/decred/dcrd/wire"
 )
 
+func orPanic(err error) {
+	if err != nil {
+		panic(err)
+	}
+}
+
+func log(format string, args ...interface{}) {
+	fmt.Printf(format, args...)
+	fmt.Printf("\n")
+}
+
 func wif2secpPrivKey(addr string) *secp256k1.PrivateKey {
 	wif, err := dcrutil.DecodeWIF(addr)
 	orPanic(err)
@@ -60,6 +71,9 @@ func srcAndDstFees(srcTx, dstTx *wire.MsgTx, utxos utxoMap) {
 		dcrutil.Amount(dstFee), dstFeeRate)
 }
 
+// makeSrcTx will prepare a src transaction that will include an output (index 0)
+// redeemable by a schnorr signature. The address of the public key of the
+// schnorr sig is expected in addr.
 func makeSrcTx(w1change *wire.TxOut, w1inputs []*wire.TxIn,
 	w2change *wire.TxOut, w2inputs []*wire.TxIn, addr dcrutil.Address) *wire.MsgTx {
 
@@ -84,6 +98,8 @@ func makeSrcTx(w1change *wire.TxOut, w1inputs []*wire.TxIn,
 	return tx
 }
 
+// makeDstTx will prepare a transaction that redeems from the schnorr utxo
+// (index 0) of the src transaction into return addresses for two wallets.
 func makeDstTx(dst1, dst2 dcrutil.Address, srcTx *wire.MsgTx) *wire.MsgTx {
 
 	srcHash := srcTx.TxHash()
@@ -104,6 +120,8 @@ func makeDstTx(dst1, dst2 dcrutil.Address, srcTx *wire.MsgTx) *wire.MsgTx {
 	return tx
 }
 
+// makeSingleSrcTx will create a transaction that pays into a schnorr pubkey
+// address indicated in addr.
 func makeSingleSrcTx(w1change *wire.TxOut, w1inputs []*wire.TxIn,
 	addr dcrutil.Address) *wire.MsgTx {
 
@@ -132,6 +150,8 @@ func makeSingleSrcTx(w1change *wire.TxOut, w1inputs []*wire.TxIn,
 	return tx
 }
 
+// makeSingleDstTx redeems from the schnorr utxo (index 0) of srcTx into
+// a return address.
 func makeSingleDstTx(destAddr dcrutil.Address, srcTx *wire.MsgTx) *wire.MsgTx {
 	srcHash := srcTx.TxHash()
 	tx := wire.NewMsgTx()
